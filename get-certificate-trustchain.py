@@ -84,10 +84,8 @@ def get_certificate_type(certificate: bytes):
         return "DER"
 
 
-def get_trustchain(certificate: bytes) -> Iterator[bytes]:
+def get_trustchain_from_uri(certificate: bytes) -> Iterator[bytes]:
     """Returns a chain of issuer certificates up to the root certificate."""
-    if get_certificate_type(certificate) == "DER":
-        certificate = der_certificate_to_pem(certificate)
     while True:
         issuer_uri = get_issuer_url(certificate)
         if issuer_uri is None:
@@ -99,6 +97,29 @@ def get_trustchain(certificate: bytes) -> Iterator[bytes]:
         yield issuer_cert
         # Repeat, but now for the issuer cert.
         certificate = issuer_cert
+
+
+def get_chained_certificates(certificate: bytes) -> Iterator[bytes]:
+    begin_pos = 0
+    end_marker = b"-----END CERTIFICATE-----"
+    while True:
+        end_pos = certificate.find(end_marker, begin_pos)
+        if end_pos == -1:
+            return
+        end_pos += len(end_marker)
+        yield certificate[begin_pos: end_pos]
+        begin_pos = end_pos
+
+
+def get_trustchain(certificate: bytes) -> Iterator[bytes]:
+    cert_chain = get_chained_certificates(certificate)
+    domain_certificate = next(cert_chain)
+    issuer_certificate = None
+    for issuer_certificate in cert_chain:
+        yield issuer_certificate
+    last_cert = issuer_certificate or domain_certificate
+    for issuer_certificate in get_trustchain_from_uri(last_cert):
+        yield issuer_certificate
 
 
 def argument_parser() -> argparse.ArgumentParser:
@@ -116,8 +137,11 @@ def argument_parser() -> argparse.ArgumentParser:
 def main():
     args = argument_parser().parse_args()
     certificate = Path(args.certificate).read_bytes()
+    if get_certificate_type(certificate) == "DER":
+        certificate = der_certificate_to_pem(certificate)
     with open(args.output, "wb") as output_h:
         for issuer in get_trustchain(certificate):
+            print(pem_certificate_to_text(issuer).decode())
             output_h.write(issuer)
 
 
