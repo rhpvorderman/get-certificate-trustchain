@@ -47,8 +47,15 @@ def pem_certificate_to_text(certificate: bytes) -> bytes:
 
 def der_certificate_to_pem(certificate: bytes) -> bytes:
     """Convert a DER encoded certificate to PEM"""
-    return _process_external(["openssl", "x509", "-inform", "DER",
-                              "-outform", "PEM"], certificate)
+    try:
+        return _process_external(["openssl", "x509", "-inform", "DER",
+                                  "-outform", "PEM"], certificate)
+    except subprocess.CalledProcessError:
+        certificates = _process_external(
+            ["openssl", "pkcs7", "-print_certs", "-inform", "DER"], certificate
+        )
+        begin = certificates.find(b"-----BEGIN")
+        return certificates[begin:]
 
 
 def get_issuer_url(certificate: bytes) -> Optional[bytes]:
@@ -75,10 +82,10 @@ def retrieve_uri_bytes(uri: bytes) -> bytes:
     return httpresponse.read()
 
 
-def get_certificate_type(certificate: bytes):
+def get_certificate_encoding(certificate: bytes):
     """Determine whether a certificate is DER or PEM encoded by looking at
     the starting bytes."""
-    if certificate.startswith(b"-----BEGIN CERTIFICATE-----"):
+    if certificate.startswith(b"-----BEGIN"):
         return "PEM"
     else:
         return "DER"
@@ -92,7 +99,7 @@ def get_trustchain_from_uri(certificate: bytes) -> Iterator[bytes]:
             # No issuer URI, this is the root certificate.
             return
         issuer_cert = retrieve_uri_bytes(issuer_uri)
-        if get_certificate_type(issuer_cert) == "DER":
+        if get_certificate_encoding(issuer_cert) == "DER":
             issuer_cert = der_certificate_to_pem(issuer_cert)
         yield issuer_cert
         # Repeat, but now for the issuer cert.
@@ -101,13 +108,13 @@ def get_trustchain_from_uri(certificate: bytes) -> Iterator[bytes]:
 
 def get_chained_certificates(certificate: bytes) -> Iterator[bytes]:
     begin_pos = 0
-    end_marker = b"-----END CERTIFICATE-----"
+    end_marker = b"-----END CERTIFICATE-----\n"
     while True:
         end_pos = certificate.find(end_marker, begin_pos)
         if end_pos == -1:
             return
         end_pos += len(end_marker)
-        yield certificate[begin_pos: end_pos]
+        yield certificate[begin_pos: end_pos].lstrip(b"\n")
         begin_pos = end_pos
 
 
@@ -137,11 +144,10 @@ def argument_parser() -> argparse.ArgumentParser:
 def main():
     args = argument_parser().parse_args()
     certificate = Path(args.certificate).read_bytes()
-    if get_certificate_type(certificate) == "DER":
+    if get_certificate_encoding(certificate) == "DER":
         certificate = der_certificate_to_pem(certificate)
     with open(args.output, "wb") as output_h:
         for issuer in get_trustchain(certificate):
-            print(pem_certificate_to_text(issuer).decode())
             output_h.write(issuer)
 
 
