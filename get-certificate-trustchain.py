@@ -40,22 +40,56 @@ def _process_external(command: List[str], input: bytes) -> bytes:
 
 
 def pem_certificate_to_text(certificate: bytes) -> bytes:
-    """Get text information from a PEM encoded certificate"""
+    """Get text information from a PEM encoded certificate."""
     return _process_external(["openssl", "x509", "-text", "-noout"],
                              certificate)
 
 
-def der_certificate_to_pem(certificate: bytes) -> bytes:
-    """Convert a DER encoded certificate to PEM"""
+def pkcs7_store_to_pem_chain(store: bytes, format="PEM") -> bytes:
+    """Convert a pkcs7 certificate store to a concatenated list of one or
+    more X509 PEM certificates."""
+    return _process_external(["openssl", "pkcs7", "--print_certs",
+                              "-inform", format], store)
+
+
+def x509_der_to_pem(der_cert):
+    """Convert a X509 DER-encoded certificate to a PEM certificate."""
+    return _process_external(["openssl", "x509", "-inform", "DER",
+                              "-outform", "PEM"], der_cert)
+
+
+def any_cert_to_x509_pem_chain(cert: bytes) -> bytes:
+    """Convert any certificate to a concatenated list containing one or more
+    x509 PEM  certificates."""
+    if cert.find(b"-----BEGIN CERTIFICATE") != -1:
+        # PEM encoded X509 Format
+        return cert
+    if cert.find(b"-----BEGIN PKCS7") != -1:
+        # PEM encoded PKCS7 format
+        return pkcs7_store_to_pem_chain(cert, "PEM")
+
+    # DER encoding handling.
+    # TODO: Find a way to get the type without trail and error.
     try:
-        return _process_external(["openssl", "x509", "-inform", "DER",
-                                  "-outform", "PEM"], certificate)
+        return x509_der_to_pem(cert)
     except subprocess.CalledProcessError:
-        certificates = _process_external(
-            ["openssl", "pkcs7", "-print_certs", "-inform", "DER"], certificate
-        )
-        begin = certificates.find(b"-----BEGIN")
-        return certificates[begin:]
+        return pkcs7_store_to_pem_chain(cert, "DER")
+
+
+def x509_chain_to_individual_pem_certs(cert_chain: bytes) -> Iterator[bytes]:
+    begin_pos = 0
+    begin_marker = b"-----BEGIN CERTIFICATE----"
+    end_marker = b"-----END CERTIFICATE-----"
+    while True:
+        begin_pos = cert_chain.find(begin_marker, begin_pos)
+        if begin_pos == -1:
+            return
+        end_pos = cert_chain.find(end_marker, begin_pos)
+        if end_pos == -1:
+            raise EOFError("Truncated certificate")
+        end_pos += len(end_marker)
+        yield cert_chain[begin_pos: end_pos] + b"\n"
+        begin_pos = end_pos
 
 
 def get_issuer_url(certificate: bytes) -> Optional[bytes]:
@@ -82,51 +116,28 @@ def retrieve_uri_bytes(uri: bytes) -> bytes:
     return httpresponse.read()
 
 
-def get_certificate_encoding(certificate: bytes):
-    """Determine whether a certificate is DER or PEM encoded by looking at
-    the starting bytes."""
-    if certificate.startswith(b"-----BEGIN"):
-        return "PEM"
-    else:
-        return "DER"
+def get_issuer_cert_using_uri(certificate: bytes) -> Optional[bytes]:
+    issuer_uri = get_issuer_url(certificate)
+    if issuer_uri is None:
+        # No issuer URI, this is the root certificate.
+        return None
+    issuer_cert = retrieve_uri_bytes(issuer_uri)
+    return issuer_cert
 
 
-def get_trustchain_from_uri(certificate: bytes) -> Iterator[bytes]:
-    """Returns a chain of issuer certificates up to the root certificate."""
+def get_certificate_chain(certificate: bytes) -> Iterator[bytes]:
     while True:
-        issuer_uri = get_issuer_url(certificate)
-        if issuer_uri is None:
-            # No issuer URI, this is the root certificate.
+        # Make sure the certificate is in x509 PEM format. Possibly with
+        # multiple certs
+        pem_chain = any_cert_to_x509_pem_chain(certificate)
+        # Iterate over the pem_chain.
+        for certificate in x509_chain_to_individual_pem_certs(pem_chain):
+            yield certificate
+        # `certificate` is the last certificate from the chain. Get its issuer
+        # from an URI.
+        certificate = get_issuer_cert_using_uri(certificate)
+        if certificate is None:  # No issuer. We have reached the root.
             return
-        issuer_cert = retrieve_uri_bytes(issuer_uri)
-        if get_certificate_encoding(issuer_cert) == "DER":
-            issuer_cert = der_certificate_to_pem(issuer_cert)
-        yield issuer_cert
-        # Repeat, but now for the issuer cert.
-        certificate = issuer_cert
-
-
-def get_chained_certificates(certificate: bytes) -> Iterator[bytes]:
-    begin_pos = 0
-    end_marker = b"-----END CERTIFICATE-----\n"
-    while True:
-        end_pos = certificate.find(end_marker, begin_pos)
-        if end_pos == -1:
-            return
-        end_pos += len(end_marker)
-        yield certificate[begin_pos: end_pos].lstrip(b"\n")
-        begin_pos = end_pos
-
-
-def get_trustchain(certificate: bytes) -> Iterator[bytes]:
-    cert_chain = get_chained_certificates(certificate)
-    domain_certificate = next(cert_chain)
-    issuer_certificate = None
-    for issuer_certificate in cert_chain:
-        yield issuer_certificate
-    last_cert = issuer_certificate or domain_certificate
-    for issuer_certificate in get_trustchain_from_uri(last_cert):
-        yield issuer_certificate
 
 
 def argument_parser() -> argparse.ArgumentParser:
@@ -144,10 +155,11 @@ def argument_parser() -> argparse.ArgumentParser:
 def main():
     args = argument_parser().parse_args()
     certificate = Path(args.certificate).read_bytes()
-    if get_certificate_encoding(certificate) == "DER":
-        certificate = der_certificate_to_pem(certificate)
+    certificate_chain = get_certificate_chain(certificate)
+    # We don't need the domain certificate so skip the first certificate.
+    next(certificate_chain)
     with open(args.output, "wb") as output_h:
-        for issuer in get_trustchain(certificate):
+        for issuer in certificate_chain:
             output_h.write(issuer)
 
 
