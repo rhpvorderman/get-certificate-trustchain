@@ -22,6 +22,7 @@
 
 """Functions to get the SSL trustchain by parsing information from a
 certificate and downloading issuer certificates from the web."""
+
 import argparse
 import os
 import subprocess
@@ -142,12 +143,12 @@ def get_certificate_chain(certificate: bytes) -> Iterator[bytes]:
 
 def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        "Use the 'CA - Issuers URI' field to download all certificates from "
-        "the trust chain."
+        "Return all certificates in the chain except the domain cert. "
+        "Intermediate certificates are read from the provided certificate if "
+        "there are any. The 'CA Issuers - URI' field is used to resolve all "
+        "remaning certificates up until the root."
     )
-    parser.add_argument("certificate",
-                        help="The certificate for which the trust chain "
-                             "should be downloaded.")
+    parser.add_argument("certificate")
     parser.add_argument("-o", "--output", type=str, default=DEFAULT_OUTFILE)
     return parser
 
